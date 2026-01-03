@@ -1,7 +1,7 @@
 /***********************************************************************************************************************
  * File Name    : usbx_paud_thread_entry.c
  * Description  : Contains macros and functions used in usbx_paud_thread_entry.c
- *                MODIFIED: Full-duplex circular buffer loopback implementation
+ *                MODIFIED V2: Fixed packet size mismatch and improved synchronization
  **********************************************************************************************************************/
 /***********************************************************************************************************************
 * Copyright (c) 2020 - 2025 Renesas Electronics Corporation and/or its affiliates
@@ -50,29 +50,46 @@ static uint32_t g_ux_pool_memory[MEMPOOL_SIZE / VALUE_4];
 static unsigned char GLOBAL_BUFF[GBUFF_SIZE];
 
 /*******************************************************************************
- * NEW: Circular buffer management variables for full-duplex loopback
+ * FIXED V2: Circular buffer management with proper synchronization
  ******************************************************************************/
+
+/* 
+ * CRITICAL FIX: Use the SAME packet size for read and write!
+ * The actual audio data per 1ms frame at 48kHz stereo 16-bit is 192 bytes.
+ * We must read the same amount we write to keep the buffer synchronized.
+ */
+#define AUDIO_FRAME_SIZE_BYTES      (192U)  /* 48000Hz * 2ch * 2bytes / 1000ms = 192 bytes/ms */
+
 /* Write position for incoming audio (from host playback) */
 static volatile uint32_t g_circ_write_pos = 0;
 
 /* Read position for outgoing audio (to host recording) */
 static volatile uint32_t g_circ_read_pos = 0;
 
-/* Total bytes written to buffer (tracks how much data is available) */
-static volatile uint32_t g_total_bytes_written = 0;
+/* 
+ * Available bytes in buffer (using a single variable avoids race conditions)
+ * This is incremented by writer and decremented by reader atomically
+ */
+static volatile int32_t g_bytes_available = 0;
 
-/* Total bytes read from buffer */
-static volatile uint32_t g_total_bytes_read = 0;
+/* Minimum buffering before starting playback (in bytes) - ~100ms of audio for safety */
+/* 48000 Hz * 2 channels * 2 bytes * 0.1 sec = 19200 bytes */
+#define MIN_BUFFER_THRESHOLD    (19200U)
 
 /* Minimum buffering before starting playback (in bytes) - ~50ms of audio */
 /* 48000 Hz * 2 channels * 2 bytes * 0.05 sec = 9600 bytes */
-#define MIN_BUFFER_THRESHOLD    (9600U)
+/* #define MIN_BUFFER_THRESHOLD    (9600U) */
 
 /* Flag to indicate if we have enough data buffered to start output */
 static volatile uint8_t g_buffer_ready = 0;
 
 /* Flag to track if loopback is active */
 static volatile uint8_t g_loopback_active = 0;
+
+/* Debug counters for monitoring */
+static volatile uint32_t g_underrun_count = 0;
+static volatile uint32_t g_frames_written = 0;
+static volatile uint32_t g_frames_read = 0;
 
 /*******************************************************************************
  * End of new variables
@@ -97,8 +114,10 @@ static void apl_audio_write_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG
 static void apl_audio_instance_activate (void * p_instance);
 static void apl_audio_instance_deactivate (void * p_instance);
 
-/* NEW: Helper function to reset circular buffer state */
+/* Helper functions */
 static void reset_circular_buffer(void);
+static inline void copy_to_circular_buffer(const uint8_t *src, uint32_t len);
+static inline void copy_from_circular_buffer(uint8_t *dst, uint32_t len);
 
 /* USBX PAUD entry function */
 void usbx_paud_thread_entry(void)
@@ -240,7 +259,7 @@ void usbx_paud_thread_entry(void)
     /* Clear write buffer */
     memset(g_write_buf, VALUE_0, USB_MAX_PACKET_SIZE_IN);
 
-    /* NEW: Initialize circular buffer */
+    /* Initialize circular buffer */
     reset_circular_buffer();
 
     /* Open USB driver */
@@ -281,7 +300,7 @@ void usbx_paud_thread_entry(void)
             g_read_alternate_setting    = USB_APL_OFF;
             g_write_alternate_setting   = USB_APL_OFF;
 
-            /* NEW: Reset circular buffer on disconnect */
+            /* Reset circular buffer on disconnect */
             reset_circular_buffer();
 
             /* Event flags are used to register USB events such as ATTACH and REMOVE */
@@ -300,23 +319,62 @@ void usbx_paud_thread_entry(void)
 }
 
 /*******************************************************************************************************************//**
- * NEW: Helper function to reset circular buffer state
+ * Helper function to reset circular buffer state
  **********************************************************************************************************************/
 static void reset_circular_buffer(void)
 {
+    /* Disable interrupts during reset to prevent race conditions */
+    __disable_irq();
+
     g_circ_write_pos = 0;
     g_circ_read_pos = 0;
-    g_total_bytes_written = 0;
-    g_total_bytes_read = 0;
+    g_bytes_available = 0;
     g_buffer_ready = 0;
     g_loopback_active = 0;
     g_counter = 0;
     g_read_counter = 0;
     g_write_counter = 0;
     g_flag = 0;
+    g_underrun_count = 0;
+    g_frames_written = 0;
+    g_frames_read = 0;
 
     /* Clear the buffer with silence (zero) */
     memset(GLOBAL_BUFF, 0, GBUFF_SIZE);
+
+    __enable_irq();
+}
+
+/*******************************************************************************************************************//**
+ * Helper function to copy data TO circular buffer (used by reader/receiver)
+ **********************************************************************************************************************/
+static inline void copy_to_circular_buffer(const uint8_t *src, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+    {
+        GLOBAL_BUFF[g_circ_write_pos] = src[i];
+        g_circ_write_pos++;
+        if (g_circ_write_pos >= GBUFF_SIZE)
+        {
+            g_circ_write_pos = 0;
+        }
+    }
+}
+
+/*******************************************************************************************************************//**
+ * Helper function to copy data FROM circular buffer (used by writer/transmitter)
+ **********************************************************************************************************************/
+static inline void copy_from_circular_buffer(uint8_t *dst, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+    {
+        dst[i] = GLOBAL_BUFF[g_circ_read_pos];
+        g_circ_read_pos++;
+        if (g_circ_read_pos >= GBUFF_SIZE)
+        {
+            g_circ_read_pos = 0;
+        }
+    }
 }
 
 /*******************************************************************************************************************//**
@@ -374,7 +432,7 @@ static void apl_audio_read_change (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULON
         }
         else
         {
-            /* NEW: Reset buffer when stream starts */
+            /* Reset buffer when stream starts */
             reset_circular_buffer();
             PRINT_INFO_STR("Audio IN stream started (Host Playback -> MCU)");
 
@@ -414,7 +472,7 @@ static void apl_audio_read_change (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULON
 
 /*******************************************************************************************************************//**
  * @brief       Callback function called when completing of OUT transfer reception
- *              MODIFIED: Implements circular buffer for continuous audio capture
+ *              FIXED V2: Uses actual received length, not max packet size
  * @param[IN]   p_stream            Pointer to UX_DEVICE_CLASS_AUDIO_STREAM structure
  *              actual_length       Actual Length
  * @retval      UX_SUCCESS          Upon successful
@@ -426,7 +484,7 @@ static void apl_audio_read_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG 
     UCHAR * p_buffer            = NULL;
     ULONG   length              = VALUE_0;
 
-    data_length_playback = actual_length;
+    FSP_PARAMETER_NOT_USED(actual_length);
 
     if (USB_APL_ON == g_read_alternate_setting)
     {
@@ -434,33 +492,35 @@ static void apl_audio_read_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG 
         if (UX_SUCCESS == ux_err)
         {
             /*******************************************************************
-             * MODIFIED: Circular buffer implementation
-             * Audio data is continuously written, wrapping around when full
+             * FIXED V2: Copy EXACTLY the received length to circular buffer
+             * This ensures we don't create read/write pointer drift
              *******************************************************************/
-            for (UINT index = RESET_VALUE; index < length; index++)
+            if (length > 0)
             {
-                GLOBAL_BUFF[g_circ_write_pos] = *(p_buffer + index);
-                g_circ_write_pos++;
+                /* Copy received data to circular buffer */
+                copy_to_circular_buffer(p_buffer, length);
 
-                /* Wrap around when we reach the end of buffer */
-                if (g_circ_write_pos >= GBUFF_SIZE)
+                /* Update available byte count atomically */
+                __disable_irq();
+                g_bytes_available += (int32_t)length;
+                
+                /* Prevent buffer overflow - if we're about to overwrite unread data */
+                if (g_bytes_available > (int32_t)(GBUFF_SIZE - AUDIO_FRAME_SIZE_BYTES))
                 {
-                    g_circ_write_pos = 0;
+                    /* Buffer overflow - we're writing faster than reading */
+                    /* This shouldn't happen in normal operation */
+                    g_bytes_available = GBUFF_SIZE - AUDIO_FRAME_SIZE_BYTES;
                 }
-            }
+                __enable_irq();
 
-            /* Track total bytes written */
-            g_total_bytes_written += length;
-
-            /* Check if we have enough data buffered to start output */
-            if (!g_buffer_ready)
-            {
-                uint32_t bytes_available = g_total_bytes_written - g_total_bytes_read;
-                if (bytes_available >= MIN_BUFFER_THRESHOLD)
+                /* Check if we have enough data buffered to start output */
+                if (!g_buffer_ready && g_bytes_available >= (int32_t)MIN_BUFFER_THRESHOLD)
                 {
                     g_buffer_ready = 1;
                     PRINT_INFO_STR("Buffer ready for loopback output");
                 }
+
+                g_frames_written++;
             }
 
             g_read_frame_num++;
@@ -499,36 +559,33 @@ static void apl_audio_read_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG 
 static void apl_audio_write_change (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG alternate_setting)
 {
     UINT ux_err              = UX_SUCCESS;
+    uint8_t send_buffer[AUDIO_FRAME_SIZE_BYTES];
 
     if (USB_APL_ON == alternate_setting)
     {
         PRINT_INFO_STR("Audio OUT stream started (MCU -> Host Recording)");
 
-        /* NEW: Mark loopback as active */
+        /* Mark loopback as active */
         g_loopback_active = 1;
 
         /* Send initial frame (silence if buffer not ready) */
-        if (g_buffer_ready)
+        if (g_buffer_ready && g_bytes_available >= (int32_t)AUDIO_FRAME_SIZE_BYTES)
         {
             /* Copy data from circular buffer */
-            for (UINT i = 0; i < USB_MAX_PACKET_SIZE_IN; i++)
-            {
-                g_write_buf[i] = GLOBAL_BUFF[g_circ_read_pos];
-                g_circ_read_pos++;
-                if (g_circ_read_pos >= GBUFF_SIZE)
-                {
-                    g_circ_read_pos = 0;
-                }
-            }
-            g_total_bytes_read += USB_MAX_PACKET_SIZE_IN;
+            copy_from_circular_buffer(send_buffer, AUDIO_FRAME_SIZE_BYTES);
+
+            __disable_irq();
+            g_bytes_available -= AUDIO_FRAME_SIZE_BYTES;
+            __enable_irq();
         }
         else
         {
             /* Send silence until we have buffered enough data */
-            memset(g_write_buf, 0, USB_MAX_PACKET_SIZE_IN);
+            memset(send_buffer, 0, AUDIO_FRAME_SIZE_BYTES);
         }
 
-        ux_err = ux_device_class_audio_frame_write(p_stream, g_write_buf, USB_MAX_PACKET_SIZE_IN);
+        /* FIXED: Send AUDIO_FRAME_SIZE_BYTES (192) instead of USB_MAX_PACKET_SIZE_IN (200) */
+        ux_err = ux_device_class_audio_frame_write(p_stream, send_buffer, AUDIO_FRAME_SIZE_BYTES);
         if (UX_SUCCESS == ux_err)
         {
             ux_err = ux_device_class_audio_transmission_start(p_stream);
@@ -566,7 +623,7 @@ static void apl_audio_write_change (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULO
 
 /*******************************************************************************************************************//**
  * @brief       Callback function called when completing of IN transfer transmission
- *              MODIFIED: Reads from circular buffer with underrun protection
+ *              FIXED V2: Uses AUDIO_FRAME_SIZE_BYTES (192) to match input
  * @param[IN]   p_stream            Pointer to UX_DEVICE_CLASS_AUDIO_STREAM structure
  *              actual_length       Actual Length
  * @retval      None
@@ -575,56 +632,39 @@ static void apl_audio_write_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG
 {
     FSP_PARAMETER_NOT_USED(actual_length);
     UINT ux_err = UX_SUCCESS;
-    uint8_t send_buffer[USB_MAX_PACKET_SIZE_IN];
+    uint8_t send_buffer[AUDIO_FRAME_SIZE_BYTES];
 
     if (USB_APL_ON == g_write_alternate_setting)
     {
         /*******************************************************************
-         * MODIFIED: Read from circular buffer with underrun protection
-         * Only sends actual audio data if buffer has enough data available
+         * FIXED V2: Read AUDIO_FRAME_SIZE_BYTES (192) to match what we receive
+         * This keeps the read/write pointers synchronized
          *******************************************************************/
 
-        /* Calculate how many bytes are available in the buffer */
-        uint32_t bytes_available;
-        if (g_total_bytes_written >= g_total_bytes_read)
-        {
-            bytes_available = g_total_bytes_written - g_total_bytes_read;
-        }
-        else
-        {
-            /* Handle counter overflow (unlikely but safe) */
-            bytes_available = 0;
-        }
-
         /* Check if we have enough data to send */
-        if (g_buffer_ready && bytes_available >= USB_MAX_PACKET_SIZE_IN)
+        if (g_buffer_ready && g_bytes_available >= (int32_t)AUDIO_FRAME_SIZE_BYTES)
         {
             /* Copy data from circular buffer */
-            for (UINT i = 0; i < USB_MAX_PACKET_SIZE_IN; i++)
-            {
-                send_buffer[i] = GLOBAL_BUFF[g_circ_read_pos];
-                g_circ_read_pos++;
-                if (g_circ_read_pos >= GBUFF_SIZE)
-                {
-                    g_circ_read_pos = 0;
-                }
-            }
-            g_total_bytes_read += USB_MAX_PACKET_SIZE_IN;
+            copy_from_circular_buffer(send_buffer, AUDIO_FRAME_SIZE_BYTES);
+
+            __disable_irq();
+            g_bytes_available -= AUDIO_FRAME_SIZE_BYTES;
+            __enable_irq();
+
+            g_frames_read++;
         }
         else
         {
             /* Underrun: not enough data available, send silence */
-            memset(send_buffer, 0, USB_MAX_PACKET_SIZE_IN);
+            memset(send_buffer, 0, AUDIO_FRAME_SIZE_BYTES);
+            g_underrun_count++;
 
-            /* If we had data before but now underrun, log it */
-            if (g_buffer_ready && bytes_available < USB_MAX_PACKET_SIZE_IN)
-            {
-                /* Buffer underrun occurred - might want to log this for debugging */
-                /* PRINT_INFO_STR("Buffer underrun - sending silence"); */
-            }
+            /* Optional: Log underrun for debugging (uncomment if needed) */
+            /* if ((g_underrun_count % 100) == 1) { PRINT_INFO_STR("Buffer underrun"); } */
         }
 
-        ux_err = ux_device_class_audio_frame_write(p_stream, send_buffer, USB_MAX_PACKET_SIZE_IN);
+        /* FIXED: Send AUDIO_FRAME_SIZE_BYTES (192) instead of USB_MAX_PACKET_SIZE_IN (200) */
+        ux_err = ux_device_class_audio_frame_write(p_stream, send_buffer, AUDIO_FRAME_SIZE_BYTES);
         if (ux_err != UX_SUCCESS)
         {
             PRINT_ERR_STR("ux_device_class_audio_frame_write is failed");
@@ -667,7 +707,7 @@ static void apl_audio_instance_deactivate (void * p_instance)
     FSP_PARAMETER_NOT_USED(p_instance);
     g_p_audio = UX_NULL;
 
-    /* NEW: Reset buffer on deactivation */
+    /* Reset buffer on deactivation */
     reset_circular_buffer();
 }
 /*******************************************************************************************************************//**
