@@ -2,6 +2,7 @@
  * File Name    : usbx_paud_thread_entry.c
  * Description  : Contains macros and functions used in usbx_paud_thread_entry.c
  *                MODIFIED V2: Fixed packet size mismatch and improved synchronization
+ *                MODIFIED V3: Integrated test sine wave generator for debugging
  **********************************************************************************************************************/
 /***********************************************************************************************************************
 * Copyright (c) 2020 - 2025 Renesas Electronics Corporation and/or its affiliates
@@ -12,6 +13,7 @@
 #include "usbx_paud_thread.h"
 #include "common_utils.h"
 #include "usbx_paud_ep.h"
+#include "audio_test_signal.h"    /* Test sine wave generator */
 
 /*******************************************************************************************************************//**
  * @addtogroup usbx_paud_ep
@@ -272,6 +274,24 @@ void usbx_paud_thread_entry(void)
     }
     PRINT_INFO_STR("USB driver opened successfully");
 
+    /***************************************************************************
+     * Print operating mode information
+     * This helps identify whether test mode or normal loopback is active
+     ***************************************************************************/
+#if TEST_SINE_GENERATOR_ENABLE
+    PRINT_INFO_STR("========================================");
+    PRINT_INFO_STR("*** TEST MODE: Sine Wave Generator ***");
+    PRINT_INFO_STR("  Left channel:  500 Hz, 80% amplitude");
+    PRINT_INFO_STR("  Right channel: 1000 Hz, 50% amplitude");
+    PRINT_INFO_STR("  USB input will be IGNORED");
+    PRINT_INFO_STR("========================================");
+#else
+    PRINT_INFO_STR("========================================");
+    PRINT_INFO_STR("*** NORMAL MODE: USB Audio Loopback ***");
+    PRINT_INFO_STR("  Buffer threshold: 100ms");
+    PRINT_INFO_STR("========================================");
+#endif
+
     PRINT_INFO_STR("Insert the USB cable");
 
     /* Event flags are used to register USB events such as ATTACH and REMOVE */
@@ -343,6 +363,15 @@ static void reset_circular_buffer(void)
     memset(GLOBAL_BUFF, 0, GBUFF_SIZE);
 
     __enable_irq();
+
+    /***************************************************************************
+     * Reset the test signal generator phase accumulators
+     * This ensures the sine wave starts from a consistent point (0 degrees)
+     * when a new audio stream begins
+     ***************************************************************************/
+#if TEST_SINE_GENERATOR_ENABLE
+    audio_test_signal_reset();
+#endif
 }
 
 /*******************************************************************************************************************//**
@@ -492,9 +521,16 @@ static void apl_audio_read_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG 
         if (UX_SUCCESS == ux_err)
         {
             /*******************************************************************
-             * FIXED V2: Copy EXACTLY the received length to circular buffer
-             * This ensures we don't create read/write pointer drift
+             * In TEST MODE: Still receive the data but don't use it
+             * This keeps the USB audio stream active on the host side
+             * 
+             * In NORMAL MODE: Copy received audio to circular buffer
              *******************************************************************/
+#if TEST_SINE_GENERATOR_ENABLE
+            /* Test mode: Just count the frames, ignore the actual audio data */
+            g_frames_written++;
+#else
+            /* Normal loopback mode: Copy received audio to circular buffer */
             if (length > 0)
             {
                 /* Copy received data to circular buffer */
@@ -522,6 +558,7 @@ static void apl_audio_read_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG 
 
                 g_frames_written++;
             }
+#endif /* TEST_SINE_GENERATOR_ENABLE */
 
             g_read_frame_num++;
             g_length = g_length + length;
@@ -568,7 +605,19 @@ static void apl_audio_write_change (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULO
         /* Mark loopback as active */
         g_loopback_active = 1;
 
-        /* Send initial frame (silence if buffer not ready) */
+        /***************************************************************************
+         * Prepare the initial audio frame to send
+         * 
+         * In TEST MODE: Generate a sine wave test signal
+         * In NORMAL MODE: Send buffered audio or silence
+         ***************************************************************************/
+#if TEST_SINE_GENERATOR_ENABLE
+        /* Test mode: Reset the generator and create the first frame of sine wave */
+        audio_test_signal_reset();
+        audio_test_signal_generate(send_buffer, AUDIO_FRAME_SIZE_BYTES);
+        PRINT_INFO_STR("Generating test sine waves...");
+#else
+        /* Normal loopback mode: Send buffered audio if available, otherwise silence */
         if (g_buffer_ready && g_bytes_available >= (int32_t)AUDIO_FRAME_SIZE_BYTES)
         {
             /* Copy data from circular buffer */
@@ -583,6 +632,7 @@ static void apl_audio_write_change (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULO
             /* Send silence until we have buffered enough data */
             memset(send_buffer, 0, AUDIO_FRAME_SIZE_BYTES);
         }
+#endif /* TEST_SINE_GENERATOR_ENABLE */
 
         /* FIXED: Send AUDIO_FRAME_SIZE_BYTES (192) instead of USB_MAX_PACKET_SIZE_IN (200) */
         ux_err = ux_device_class_audio_frame_write(p_stream, send_buffer, AUDIO_FRAME_SIZE_BYTES);
@@ -636,12 +686,22 @@ static void apl_audio_write_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG
 
     if (USB_APL_ON == g_write_alternate_setting)
     {
-        /*******************************************************************
-         * FIXED V2: Read AUDIO_FRAME_SIZE_BYTES (192) to match what we receive
-         * This keeps the read/write pointers synchronized
-         *******************************************************************/
-
-        /* Check if we have enough data to send */
+        /***************************************************************************
+         * Prepare audio data to send to the host
+         * 
+         * In TEST MODE: Generate sine wave data
+         *   - This bypasses the circular buffer entirely
+         *   - If drops still occur with test mode, the problem is in USB output path
+         * 
+         * In NORMAL MODE: Read from circular buffer
+         *   - If drops occur only in normal mode, problem is in USB input or buffering
+         ***************************************************************************/
+#if TEST_SINE_GENERATOR_ENABLE
+        /* Test mode: Generate sine wave test signal */
+        audio_test_signal_generate(send_buffer, AUDIO_FRAME_SIZE_BYTES);
+        g_frames_read++;
+#else
+        /* Normal loopback mode: Read from circular buffer */
         if (g_buffer_ready && g_bytes_available >= (int32_t)AUDIO_FRAME_SIZE_BYTES)
         {
             /* Copy data from circular buffer */
@@ -662,6 +722,7 @@ static void apl_audio_write_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG
             /* Optional: Log underrun for debugging (uncomment if needed) */
             /* if ((g_underrun_count % 100) == 1) { PRINT_INFO_STR("Buffer underrun"); } */
         }
+#endif /* TEST_SINE_GENERATOR_ENABLE */
 
         /* FIXED: Send AUDIO_FRAME_SIZE_BYTES (192) instead of USB_MAX_PACKET_SIZE_IN (200) */
         ux_err = ux_device_class_audio_frame_write(p_stream, send_buffer, AUDIO_FRAME_SIZE_BYTES);
