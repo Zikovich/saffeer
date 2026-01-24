@@ -190,9 +190,10 @@ end
 
 %% Summary
 fprintf('\n');
-fprintf('='.^50 + '\n');
+s = repmat('=',1,50);
+fprintf('%s\n', s);
 fprintf('SUMMARY\n');
-fprintf('='.^50 + '\n');
+fprintf('%s\n', s);
 
 if ~isempty(outputMatch) && ~isempty(inputMatch) && isempty(missingToolboxes)
     fprintf('\n[SUCCESS] All requirements met!\n\n');
