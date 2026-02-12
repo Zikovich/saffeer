@@ -2,7 +2,7 @@
  * File Name    : usbx_paud_thread_entry.c
  * Description  : Contains macros and functions used in usbx_paud_thread_entry.c
  *                MODIFIED V2: Fixed packet size mismatch and improved synchronization
- *                MODIFIED V3: Integrated test sine wave generator for debugging
+ *                MODIFIED V3: Integrated test sine wave and sawtooth generators for debugging
  **********************************************************************************************************************/
 /***********************************************************************************************************************
 * Copyright (c) 2020 - 2025 Renesas Electronics Corporation and/or its affiliates
@@ -13,12 +13,24 @@
 #include "usbx_paud_thread.h"
 #include "common_utils.h"
 #include "usbx_paud_ep.h"
-#include "audio_test_signal.h"    /* Test sine wave generator */
+#include "audio_test_signal.h"        /* Sine wave generator */
+#include "audio_sawtooth_signal.h"    /* Sawtooth wave generator */
 
 /*******************************************************************************************************************//**
  * @addtogroup usbx_paud_ep
  * @{
  **********************************************************************************************************************/
+
+/*******************************************************************************
+ * TEST SIGNAL SELECTION
+ *
+ * When TEST_SINE_GENERATOR_ENABLE is set to 1 (in audio_test_signal.h),
+ * use this macro to select which waveform to generate:
+ *   0 = Sine wave (two frequencies for L/R channels)
+ *   1 = Sawtooth wave (1kHz, same on both channels)
+ ******************************************************************************/
+#define USE_SAWTOOTH_GENERATOR          (1)
+
 
 /*******************************************************************************************************************//**
  Exported global variables and functions (to be accessed by other files)
@@ -274,21 +286,20 @@ void usbx_paud_thread_entry(void)
     }
     PRINT_INFO_STR("USB driver opened successfully");
 
-    /***************************************************************************
-     * Print operating mode information
-     * This helps identify whether test mode or normal loopback is active
-     ***************************************************************************/
+    /* Print operating mode information */
 #if TEST_SINE_GENERATOR_ENABLE
     PRINT_INFO_STR("========================================");
-    PRINT_INFO_STR("*** TEST MODE: Sine Wave Generator ***");
-    PRINT_INFO_STR("  Left channel:  500 Hz, 80% amplitude");
-    PRINT_INFO_STR("  Right channel: 1000 Hz, 50% amplitude");
+    PRINT_INFO_STR("*** TEST MODE ACTIVE ***");
+    #if USE_SAWTOOTH_GENERATOR
+        PRINT_INFO_STR("  Waveform: SAWTOOTH (1kHz)");
+    #else
+        PRINT_INFO_STR("  Waveform: SINE (500Hz L, 1000Hz R)");
+    #endif
     PRINT_INFO_STR("  USB input will be IGNORED");
     PRINT_INFO_STR("========================================");
 #else
     PRINT_INFO_STR("========================================");
     PRINT_INFO_STR("*** NORMAL MODE: USB Audio Loopback ***");
-    PRINT_INFO_STR("  Buffer threshold: 100ms");
     PRINT_INFO_STR("========================================");
 #endif
 
@@ -364,13 +375,13 @@ static void reset_circular_buffer(void)
 
     __enable_irq();
 
-    /***************************************************************************
-     * Reset the test signal generator phase accumulators
-     * This ensures the sine wave starts from a consistent point (0 degrees)
-     * when a new audio stream begins
-     ***************************************************************************/
+    /* Reset the test signal generators */
 #if TEST_SINE_GENERATOR_ENABLE
-    audio_test_signal_reset();
+    #if USE_SAWTOOTH_GENERATOR
+        audio_sawtooth_reset();
+    #else
+        audio_test_signal_reset();
+    #endif
 #endif
 }
 
@@ -520,17 +531,15 @@ static void apl_audio_read_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG 
         ux_err = ux_device_class_audio_read_frame_get(p_stream, &p_buffer, &length);
         if (UX_SUCCESS == ux_err)
         {
-            /*******************************************************************
-             * In TEST MODE: Still receive the data but don't use it
-             * This keeps the USB audio stream active on the host side
-             * 
-             * In NORMAL MODE: Copy received audio to circular buffer
-             *******************************************************************/
 #if TEST_SINE_GENERATOR_ENABLE
             /* Test mode: Just count the frames, ignore the actual audio data */
             g_frames_written++;
 #else
             /* Normal loopback mode: Copy received audio to circular buffer */
+            /*******************************************************************
+             * FIXED V2: Copy EXACTLY the received length to circular buffer
+             * This ensures we don't create read/write pointer drift
+             *******************************************************************/
             if (length > 0)
             {
                 /* Copy received data to circular buffer */
@@ -558,7 +567,7 @@ static void apl_audio_read_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG 
 
                 g_frames_written++;
             }
-#endif /* TEST_SINE_GENERATOR_ENABLE */
+#endif
 
             g_read_frame_num++;
             g_length = g_length + length;
@@ -605,19 +614,19 @@ static void apl_audio_write_change (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULO
         /* Mark loopback as active */
         g_loopback_active = 1;
 
-        /***************************************************************************
-         * Prepare the initial audio frame to send
-         * 
-         * In TEST MODE: Generate a sine wave test signal
-         * In NORMAL MODE: Send buffered audio or silence
-         ***************************************************************************/
 #if TEST_SINE_GENERATOR_ENABLE
-        /* Test mode: Reset the generator and create the first frame of sine wave */
+        /* Test mode: Generate waveform for initial frame */
+    #if USE_SAWTOOTH_GENERATOR
+        audio_sawtooth_reset();
+        audio_sawtooth_generate_frame(send_buffer);
+        PRINT_INFO_STR("Generating SAWTOOTH test waveform...");
+    #else
         audio_test_signal_reset();
         audio_test_signal_generate(send_buffer, AUDIO_FRAME_SIZE_BYTES);
-        PRINT_INFO_STR("Generating test sine waves...");
+        PRINT_INFO_STR("Generating SINE test waveform...");
+    #endif
 #else
-        /* Normal loopback mode: Send buffered audio if available, otherwise silence */
+        /* Normal loopback mode */
         if (g_buffer_ready && g_bytes_available >= (int32_t)AUDIO_FRAME_SIZE_BYTES)
         {
             /* Copy data from circular buffer */
@@ -632,7 +641,7 @@ static void apl_audio_write_change (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULO
             /* Send silence until we have buffered enough data */
             memset(send_buffer, 0, AUDIO_FRAME_SIZE_BYTES);
         }
-#endif /* TEST_SINE_GENERATOR_ENABLE */
+#endif
 
         /* FIXED: Send AUDIO_FRAME_SIZE_BYTES (192) instead of USB_MAX_PACKET_SIZE_IN (200) */
         ux_err = ux_device_class_audio_frame_write(p_stream, send_buffer, AUDIO_FRAME_SIZE_BYTES);
@@ -686,22 +695,21 @@ static void apl_audio_write_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG
 
     if (USB_APL_ON == g_write_alternate_setting)
     {
-        /***************************************************************************
-         * Prepare audio data to send to the host
-         * 
-         * In TEST MODE: Generate sine wave data
-         *   - This bypasses the circular buffer entirely
-         *   - If drops still occur with test mode, the problem is in USB output path
-         * 
-         * In NORMAL MODE: Read from circular buffer
-         *   - If drops occur only in normal mode, problem is in USB input or buffering
-         ***************************************************************************/
 #if TEST_SINE_GENERATOR_ENABLE
-        /* Test mode: Generate sine wave test signal */
+        /* Test mode: Generate waveform */
+    #if USE_SAWTOOTH_GENERATOR
+        audio_sawtooth_generate_frame(send_buffer);
+    #else
         audio_test_signal_generate(send_buffer, AUDIO_FRAME_SIZE_BYTES);
+    #endif
         g_frames_read++;
 #else
-        /* Normal loopback mode: Read from circular buffer */
+        /*******************************************************************
+         * FIXED V2: Read AUDIO_FRAME_SIZE_BYTES (192) to match what we receive
+         * This keeps the read/write pointers synchronized
+         *******************************************************************/
+
+        /* Check if we have enough data to send */
         if (g_buffer_ready && g_bytes_available >= (int32_t)AUDIO_FRAME_SIZE_BYTES)
         {
             /* Copy data from circular buffer */
@@ -722,7 +730,7 @@ static void apl_audio_write_done (UX_DEVICE_CLASS_AUDIO_STREAM * p_stream, ULONG
             /* Optional: Log underrun for debugging (uncomment if needed) */
             /* if ((g_underrun_count % 100) == 1) { PRINT_INFO_STR("Buffer underrun"); } */
         }
-#endif /* TEST_SINE_GENERATOR_ENABLE */
+#endif
 
         /* FIXED: Send AUDIO_FRAME_SIZE_BYTES (192) instead of USB_MAX_PACKET_SIZE_IN (200) */
         ux_err = ux_device_class_audio_frame_write(p_stream, send_buffer, AUDIO_FRAME_SIZE_BYTES);
